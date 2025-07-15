@@ -7,33 +7,13 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"os"
 	"strconv"
 
 	_ "github.com/go-sql-driver/mysql"
 	"github.com/gorilla/mux"
+	"github.com/joho/godotenv"
 )
-
-const (
-	db_driver   = "mysql"
-	db_user     = "root"
-	db_password = "root"
-	db_name     = "golang_crud"
-)
-
-func main() {
-	r := mux.NewRouter()
-
-	r.HandleFunc("/users", createUser).Methods("POST")
-	r.HandleFunc("/users/{id}", getUser).Methods("GET")
-	r.HandleFunc("/users/{id}", updateUser).Methods("PUT")
-	r.HandleFunc("/users/{id}", deleteUser).Methods("DELETE")
-
-	log.Println("Starting server on :9000")
-	if err := http.ListenAndServe(":9000", r); err != nil {
-		log.Fatalf("Could not start server: %v", err)
-	}
-
-}
 
 type User struct {
 	ID    int    `json:"id"`
@@ -41,61 +21,82 @@ type User struct {
 	Email string `json:"email"`
 }
 
-func createUser(w http.ResponseWriter, r *http.Request) {
-	db, err := sql.Open(db_driver, db_user+":"+db_password+"@/"+db_name)
-
+func main() {
+	err := godotenv.Load()
 	if err != nil {
-		http.Error(w, "Database connection error", http.StatusInternalServerError)
-		log.Printf("Error connecting to database: %v", err)
-		return
+		log.Fatal("Error loading .env file")
 	}
 
+	r := mux.NewRouter()
+
+	r.HandleFunc("/users", createUser).Methods("POST")
+	r.HandleFunc("/users", getAllUsers).Methods("GET")
+	r.HandleFunc("/users/{id}", getUser).Methods("GET")
+	r.HandleFunc("/users/{id}", updateUser).Methods("PUT")
+	r.HandleFunc("/users/{id}", deleteUser).Methods("DELETE")
+
+	log.Println("Starting server on :9000")
+	log.Fatal(http.ListenAndServe(":9000", r))
+}
+
+func getDBConnection() (*sql.DB, error) {
+	driver := os.Getenv("DB_DRIVER")
+	user := os.Getenv("DB_USER")
+	password := os.Getenv("DB_PASSWORD")
+	name := os.Getenv("DB_NAME")
+	host := os.Getenv("DB_HOST")
+	port := os.Getenv("DB_PORT")
+
+	dsn := fmt.Sprintf("%s:%s@tcp(%s:%s)/%s", user, password, host, port, name)
+	return sql.Open(driver, dsn)
+}
+
+func createUser(w http.ResponseWriter, r *http.Request) {
+	db, err := getDBConnection()
+	if err != nil {
+		http.Error(w, "Database connection error", http.StatusInternalServerError)
+		log.Printf("DB error: %v", err)
+		return
+	}
 	defer func(db *sql.DB) {
 		err := db.Close()
 		if err != nil {
-			http.Error(w, "Database connection error", http.StatusInternalServerError)
+
 		}
 	}(db)
 
 	var user User
-	err = json.NewDecoder(r.Body).Decode(&user)
-	if err != nil {
+	if err := json.NewDecoder(r.Body).Decode(&user); err != nil {
+		http.Error(w, "Invalid JSON", http.StatusBadRequest)
 		return
 	}
 
-	err = CreateUser(db, user.Name, user.Email)
-
-	if err != nil {
+	if err := CreateUser(db, user.Name, user.Email); err != nil {
 		http.Error(w, "Error creating user", http.StatusInternalServerError)
-		log.Printf("Error creating user: %v", err)
+		log.Printf("Create error: %v", err)
 		return
 	}
 
 	w.WriteHeader(http.StatusCreated)
-    fmt.Fprintln(w, "User created successfully")
-
+	_, err = fmt.Fprintln(w, "User created successfully")
+	if err != nil {
+		return
+	}
 }
 
 func CreateUser(db *sql.DB, name, email string) error {
 	query := "INSERT INTO users (name, email) VALUES (?, ?)"
 	_, err := db.Exec(query, name, email)
-
-	if err != nil {
-		return fmt.Errorf("error inserting user: %w", err)
-	}
-
-	return nil
+	return err
 }
 
-func getUser(w http.ResponseWriter, r *http.Request) {
-	db, err := sql.Open(db_driver, db_user+":"+db_password+"@/"+db_name)
-
+func getAllUsers(w http.ResponseWriter, r *http.Request) {
+	db, err := getDBConnection()
 	if err != nil {
 		http.Error(w, "Database connection error", http.StatusInternalServerError)
-		log.Printf("Error connecting to database: %v", err)
+		log.Printf("DB error: %v", err)
 		return
 	}
-
 	defer func(db *sql.DB) {
 		err := db.Close()
 		if err != nil {
@@ -103,26 +104,75 @@ func getUser(w http.ResponseWriter, r *http.Request) {
 		}
 	}(db)
 
-	//get id parameter from the request
-	vars := mux.Vars(r)
-	idStr := vars["id"]
+	users, err := GetAllUsers(db)
+	if err != nil {
+		http.Error(w, "Error fetching users", http.StatusInternalServerError)
+		log.Printf("Fetch error: %v", err)
+		return
+	}
 
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(users); err != nil {
+		http.Error(w, "Failed to encode response", http.StatusInternalServerError)
+	}
+}
+
+func GetAllUsers(db *sql.DB) ([]User, error) {
+	rows, err := db.Query("SELECT id, name, email FROM users")
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		if err := rows.Close(); err != nil {
+			log.Printf("Error closing rows: %v", err)
+		}
+	}()
+
+	var users []User
+	for rows.Next() {
+		var user User
+		if err := rows.Scan(&user.ID, &user.Name, &user.Email); err != nil {
+			return nil, err
+		}
+		users = append(users, user)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	return users, nil
+}
+
+func getUser(w http.ResponseWriter, r *http.Request) {
+	db, err := getDBConnection()
+	if err != nil {
+		http.Error(w, "Database connection error", http.StatusInternalServerError)
+		log.Printf("DB error: %v", err)
+		return
+	}
+	defer func(db *sql.DB) {
+		err := db.Close()
+		if err != nil {
+			http.Error(w, "Database connection error", http.StatusInternalServerError)
+		}
+	}(db)
+
+	idStr := mux.Vars(r)["id"]
 	userId, err := strconv.Atoi(idStr)
 	if err != nil {
 		http.Error(w, "Invalid user ID", http.StatusBadRequest)
-		log.Printf("Error converting user ID: %v", err)
 		return
 	}
 
 	user, err := GetUser(db, userId)
 	if err != nil {
-		http.Error(w, "Error retrieving user", http.StatusInternalServerError)
-		log.Printf("Error retrieving user: %v", err)
-		return
-	}
-
-	if user == nil {
-		http.Error(w, "User not found", http.StatusNotFound)
+		if errors.Is(err, sql.ErrNoRows) {
+			http.Error(w, "User not found", http.StatusNotFound)
+		} else {
+			http.Error(w, "Error retrieving user", http.StatusInternalServerError)
+			log.Printf("Get error: %v", err)
+		}
 		return
 	}
 
@@ -140,24 +190,18 @@ func GetUser(db *sql.DB, id int) (*User, error) {
 	var user User
 	err := row.Scan(&user.ID, &user.Name, &user.Email)
 	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return nil, err
-		}
-		return nil, fmt.Errorf("error retrieving user: %w", err)
+		return nil, err
 	}
-
 	return &user, nil
 }
 
 func updateUser(w http.ResponseWriter, r *http.Request) {
-	db, err := sql.Open(db_driver, db_user+":"+db_password+"@/"+db_name)
-
+	db, err := getDBConnection()
 	if err != nil {
 		http.Error(w, "Database connection error", http.StatusInternalServerError)
-		log.Printf("Error connecting to database: %v", err)
+		log.Printf("DB error: %v", err)
 		return
 	}
-
 	defer func(db *sql.DB) {
 		err := db.Close()
 		if err != nil {
@@ -165,56 +209,41 @@ func updateUser(w http.ResponseWriter, r *http.Request) {
 		}
 	}(db)
 
-	vars := mux.Vars(r)
-	idStr := vars["id"]
+	idStr := mux.Vars(r)["id"]
 	userId, err := strconv.Atoi(idStr)
 	if err != nil {
 		http.Error(w, "Invalid user ID", http.StatusBadRequest)
-		log.Printf("Error converting user ID: %v", err)
 		return
 	}
 
 	var user User
-
-	err = json.NewDecoder(r.Body).Decode(&user)
-	if err != nil {
-		http.Error(w, "Invalid request body", http.StatusBadRequest)
-		log.Printf("Error decoding request body: %v", err)
+	if err := json.NewDecoder(r.Body).Decode(&user); err != nil {
+		http.Error(w, "Invalid JSON", http.StatusBadRequest)
 		return
 	}
 
-	err = UpdateUser(db, userId, user.Name, user.Email)
-	if err != nil {
-		http.Error(w, "User not found", http.StatusNotFound)
+	if err := UpdateUser(db, userId, user.Name, user.Email); err != nil {
+		http.Error(w, "Error updating user", http.StatusInternalServerError)
+		log.Printf("Update error: %v", err)
 		return
 	}
 
-	_, err = fmt.Fprint(w, "User updated successfully")
-	if err != nil {
-		return
-	}
+	fmt.Fprintln(w, "User updated successfully")
 }
 
 func UpdateUser(db *sql.DB, id int, name, email string) error {
 	query := "UPDATE users SET name = ?, email = ? WHERE id = ?"
 	_, err := db.Exec(query, name, email, id)
-
-	if err != nil {
-		return err
-	}
-
-	return nil
+	return err
 }
 
 func deleteUser(w http.ResponseWriter, r *http.Request) {
-	db, err := sql.Open(db_driver, db_user+":"+db_password+"@/"+db_name)
-
+	db, err := getDBConnection()
 	if err != nil {
 		http.Error(w, "Database connection error", http.StatusInternalServerError)
-		log.Printf("Error connecting to database: %v", err)
+		log.Printf("DB error: %v", err)
 		return
 	}
-
 	defer func(db *sql.DB) {
 		err := db.Close()
 		if err != nil {
@@ -222,28 +251,20 @@ func deleteUser(w http.ResponseWriter, r *http.Request) {
 		}
 	}(db)
 
-	vars := mux.Vars(r)
-	idStr := vars["id"]
+	idStr := mux.Vars(r)["id"]
 	userId, err := strconv.Atoi(idStr)
 	if err != nil {
 		http.Error(w, "Invalid user ID", http.StatusBadRequest)
-		log.Printf("Error converting user ID: %v", err)
 		return
 	}
 
-	user := DeleteUser(db, userId)
-	if user == nil {
-		http.Error(w, "User not found", http.StatusNotFound)
+	if err := DeleteUser(db, userId); err != nil {
+		http.Error(w, "Error deleting user", http.StatusInternalServerError)
+		log.Printf("Delete error: %v", err)
 		return
 	}
 
 	_, err = fmt.Fprintln(w, "User deleted successfully")
-	if err != nil {
-		return
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	err = json.NewEncoder(w).Encode(user)
 	if err != nil {
 		return
 	}
@@ -252,8 +273,5 @@ func deleteUser(w http.ResponseWriter, r *http.Request) {
 func DeleteUser(db *sql.DB, id int) error {
 	query := "DELETE FROM users WHERE id = ?"
 	_, err := db.Exec(query, id)
-	if err != nil {
-		return err
-	}
-	return nil
+	return err
 }
