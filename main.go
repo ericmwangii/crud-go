@@ -61,7 +61,7 @@ func createUser(w http.ResponseWriter, r *http.Request) {
 	defer func(db *sql.DB) {
 		err := db.Close()
 		if err != nil {
-
+			http.Error(w, "Database connection error", http.StatusInternalServerError)
 		}
 	}(db)
 
